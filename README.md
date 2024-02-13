@@ -1,2 +1,3 @@
-# tracing-rec-replay
-All that's missing is rewind
+# Tracing Rec ⏺️ Replay ⏯️
+
+All that's missing is rewind ⏪!
