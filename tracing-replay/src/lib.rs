@@ -4,33 +4,38 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing::{info_span, Span};
-use tracing_core::{field, Event, Metadata};
+use tracing_core::{
+    field,
+    span::{self, Attributes},
+    Event, Metadata,
+};
 
 pub fn crimes() {
     let metadata_store: Arc<Mutex<HashMap<u64, Metadata<'static>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let _span = info_span!("Span over them all", happy = true).entered();
+    let _span = tracing::info_span!("Span over them all", happy = true).entered();
 
     tracing::info!("This is an `info!` macro event");
 
-    {
-        let span = make_span(3, "hand-span", metadata_store.clone());
-        let _guard = span.enter();
+    let span_id = new_span(3, "hand-span", metadata_store.clone());
+    enter_span(&span_id);
 
-        write_event(1, "This is a hand-rolled event", metadata_store.clone());
-        write_event(
-            1,
-            "This is another hand-rolled event with the same metadata",
-            metadata_store.clone(),
-        );
-    }
+    write_event(1, "This is a hand-rolled event", metadata_store.clone());
+    write_event(
+        1,
+        "This is another hand-rolled event with the same metadata",
+        metadata_store.clone(),
+    );
+    exit_span(&span_id);
+
     write_event(
         2,
         "This hand-rolled event has different metadata",
         metadata_store.clone(),
     );
+
+    try_close_span(span_id);
 }
 
 enum MetadataEntry {
@@ -93,11 +98,11 @@ fn write_event(metadata_id: u64, msg: &str, store: Arc<Mutex<HashMap<u64, Metada
     });
 }
 
-fn make_span(
+fn new_span(
     metadata_id: u64,
     span_name: &'static str,
     store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
-) -> Span {
+) -> span::Id {
     tracing::dispatcher::get_default(move |dispatch| {
         let metadata = match metadata_or_create(metadata_id, span_name, store.clone()) {
             MetadataEntry::New(metadata) => {
@@ -112,7 +117,30 @@ fn make_span(
         let values = [(&field, Some(&"field-value" as &dyn field::Value))];
         let value_set = metadata.fields().value_set(&values);
 
-        Span::new(metadata, &value_set)
+        let span_id = tracing::dispatcher::get_default(move |dispatch| {
+            let span_attributes = Attributes::new(metadata, &value_set);
+            dispatch.new_span(&span_attributes)
+        });
+
+        // let span = Span::new(metadata, &value_set);
+        // span.id().unwrap()
+
+        span_id
+    })
+}
+
+fn enter_span(span_id: &span::Id) {
+    tracing::dispatcher::get_default(|dispatch| dispatch.enter(span_id));
+}
+
+fn exit_span(span_id: &span::Id) {
+    tracing::dispatcher::get_default(|dispatch| dispatch.exit(span_id));
+}
+
+fn try_close_span(span_id: span::Id) -> bool {
+    tracing::dispatcher::get_default(|dispatch| {
+        let span_id = span_id.clone();
+        dispatch.try_close(span_id)
     })
 }
 
