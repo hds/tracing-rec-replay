@@ -35,7 +35,7 @@ pub fn crimes() {
         metadata_store.clone(),
     );
 
-    try_close_span(span_id);
+    try_close_span(&span_id);
 }
 
 enum MetadataEntry {
@@ -46,7 +46,7 @@ enum MetadataEntry {
 fn metadata_or_create(
     metadata_id: u64,
     name: &'static str,
-    store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
+    store: &Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
 ) -> MetadataEntry {
     let mut guard = store.lock().unwrap();
 
@@ -76,7 +76,7 @@ fn metadata_or_create(
 
 fn write_event(metadata_id: u64, msg: &str, store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>) {
     let _enabled = tracing::dispatcher::get_default(move |dispatch| {
-        let metadata = match metadata_or_create(metadata_id, "", store.clone()) {
+        let metadata = match metadata_or_create(metadata_id, "", &store.clone()) {
             MetadataEntry::New(metadata) => {
                 dispatch.register_callsite(metadata);
                 metadata
@@ -84,7 +84,7 @@ fn write_event(metadata_id: u64, msg: &str, store: Arc<Mutex<HashMap<u64, Metada
             MetadataEntry::Existing(metadata) => metadata,
         };
 
-        let enabled = dispatch.enabled(&metadata);
+        let enabled = dispatch.enabled(metadata);
         {
             let fields = metadata.fields();
             let message_field = fields.field("message").unwrap();
@@ -104,7 +104,7 @@ fn new_span(
     store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
 ) -> span::Id {
     tracing::dispatcher::get_default(move |dispatch| {
-        let metadata = match metadata_or_create(metadata_id, span_name, store.clone()) {
+        let metadata = match metadata_or_create(metadata_id, span_name, &store.clone()) {
             MetadataEntry::New(metadata) => {
                 dispatch.register_callsite(metadata);
                 metadata
@@ -137,7 +137,7 @@ fn exit_span(span_id: &span::Id) {
     tracing::dispatcher::get_default(|dispatch| dispatch.exit(span_id));
 }
 
-fn try_close_span(span_id: span::Id) -> bool {
+fn try_close_span(span_id: &span::Id) -> bool {
     tracing::dispatcher::get_default(|dispatch| {
         let span_id = span_id.clone();
         dispatch.try_close(span_id)
