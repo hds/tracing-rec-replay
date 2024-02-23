@@ -1,4 +1,7 @@
-use std::io::{stdout, Stdout, Write};
+use std::{
+    io::{stdout, Stdout, Write},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::Serialize;
 use tracing::{field::Visit, span, subscriber::Interest, Subscriber};
@@ -10,6 +13,43 @@ pub struct Rec {
 #[must_use]
 pub fn rec_layer() -> Rec {
     Rec { writer: stdout() }
+}
+
+#[derive(Debug, Serialize)]
+struct TraceRecord {
+    meta: RecordMeta,
+    trace: Trace,
+}
+
+impl TraceRecord {
+    fn implicit(trace: Trace) -> Self {
+        Self {
+            meta: RecordMeta::new(),
+            trace,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RecordMeta {
+    timestamp_s: u64,
+    timestamp_subsec_us: u32,
+    thread_id: String,
+    thread_name: Option<String>,
+}
+
+impl RecordMeta {
+    fn new() -> Self {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let thread = std::thread::current();
+
+        Self {
+            timestamp_s: timestamp.as_secs(),
+            timestamp_subsec_us: timestamp.subsec_micros(),
+            thread_id: format!("{:?}", thread.id()),
+            thread_name: thread.name().map(Into::into),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -241,8 +281,8 @@ impl FollowsFrom {
 }
 
 impl Rec {
-    fn write_trace(&self, trace: &Trace) {
-        serde_json::to_writer(&self.writer, &trace).expect("writing failed");
+    fn write_trace(&self, trace_record: &TraceRecord) {
+        serde_json::to_writer(&self.writer, &trace_record).expect("writing failed");
         writeln!(&self.writer).expect("writing failed");
     }
 }
@@ -253,8 +293,7 @@ where
 {
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
         let trace = Trace::RegisterCallsite(metadata.into());
-        serde_json::to_writer(stdout(), &trace).expect("writing failed");
-        stdout().write_all(b"\n").expect("writing failed");
+        self.write_trace(&TraceRecord::implicit(trace));
 
         Interest::always()
     }
@@ -266,7 +305,7 @@ where
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let trace = Trace::NewSpan((attrs, id).into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_record(
@@ -276,7 +315,7 @@ where
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let trace = Trace::Record((span, values).into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_follows_from(
@@ -286,7 +325,7 @@ where
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let trace = Trace::FollowsFrom(FollowsFrom::new(follows.into(), span.into()));
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_event(
@@ -295,21 +334,21 @@ where
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let trace = Trace::Event(event.into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_enter(&self, id: &span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let trace = Trace::Enter(id.into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_exit(&self, id: &span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let trace = Trace::Exit(id.into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 
     fn on_close(&self, id: span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let trace = Trace::Close((&id).into());
-        self.write_trace(&trace);
+        self.write_trace(&TraceRecord::implicit(trace));
     }
 }
