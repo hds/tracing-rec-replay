@@ -1,176 +1,248 @@
+#![allow(clippy::many_single_char_names)]
+
 use std::{
     collections::HashMap,
-    mem::transmute,
+    error, fmt,
+    fs::File,
+    io::{self, BufReader},
     sync::{Arc, Mutex},
 };
 
-use tracing_core::{
-    field,
-    span::{self, Attributes},
-    Event, Metadata,
-};
+use tracing_core::{field, span, Event, Metadata};
 
-pub fn crimes() {
-    let metadata_store: Arc<Mutex<HashMap<u64, Metadata<'static>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+mod callsite;
+mod recording;
 
-    let _span = tracing::info_span!("Span over them all", happy = true).entered();
+use callsite::Cs;
+use recording::{Trace, TraceRecord};
 
-    tracing::info!("This is an `info!` macro event");
-
-    let span_id = new_span(3, "hand-span", metadata_store.clone());
-    enter_span(&span_id);
-
-    write_event(1, "This is a hand-rolled event", metadata_store.clone());
-    write_event(
-        1,
-        "This is another hand-rolled event with the same metadata",
-        metadata_store.clone(),
-    );
-    exit_span(&span_id);
-
-    write_event(
-        2,
-        "This hand-rolled event has different metadata",
-        metadata_store.clone(),
-    );
-
-    try_close_span(&span_id);
+/// Replay coordinator.
+///
+/// An instantiation of this object can replay a tracing recording. See [`replay_file`] for details
+/// and examples.
+///
+/// [`replay_file`]: fn@Self::replay_file
+#[derive(Debug)]
+pub struct Replay {
+    store: Arc<Mutex<HashMap<u64, &'static Metadata<'static>>>>,
 }
 
-enum MetadataEntry {
-    New(&'static Metadata<'static>),
-    Existing(&'static Metadata<'static>),
+impl Replay {
+    #[must_use = "A replayer doesn't do anything until it is given a recording to replay"]
+    pub fn new() -> Self {
+        Self {
+            store: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Replays a tracing recording file through the default dispatcher.
+    ///
+    /// The file at `path` is read and the trace records stored in the file are replayed one by
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if the file at the provided path cannot be read or if
+    /// individual records cannot be read or deserialized.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let temp_dir = tempfile::tempdir().unwrap();
+    /// # let path_buf = temp_dir.path().join("recording.tracing");
+    /// # let recording_path = path_buf.to_str().unwrap();
+    /// # {
+    /// #    use std::io::Write;
+    /// #    let mut file = std::fs::File::create(recording_path).unwrap();
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+    /// # }
+    ///
+    /// let mut replay = tracing_replay::Replay::new();
+    /// let result = replay.replay_file(recording_path);
+    ///
+    /// println!("{:?}", result);
+    /// assert!(result.is_ok());
+    /// # temp_dir.close().unwrap();
+    /// ```
+    pub fn replay_file(&mut self, path: &str) -> Result<ReplaySummary, ReplayFileError> {
+        use std::io::prelude::*;
+
+        let file =
+            File::open(path).map_err(|io_err| ReplayFileError::CannotOpenFile { inner: io_err })?;
+        let reader = BufReader::new(file);
+
+        let mut record_count = 0;
+        for (line_index, line) in reader.lines().enumerate() {
+            let line = &line.map_err(|io_err| ReplayFileError::CannotReadLine {
+                inner: io_err,
+                line_index,
+            })?;
+            let trace_record = serde_json::from_str(line).map_err(|err| {
+                ReplayFileError::CannotDeserializeRecord {
+                    inner: err,
+                    line_index,
+                    line: line.clone(),
+                }
+            })?;
+
+            self.dispatch_trace(trace_record);
+            record_count += 1;
+        }
+
+        Ok(ReplaySummary { record_count })
+    }
 }
 
-fn metadata_or_create(
-    metadata_id: u64,
-    name: &'static str,
-    store: &Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
-) -> MetadataEntry {
-    let mut guard = store.lock().unwrap();
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ReplaySummary {
+    pub record_count: usize,
+}
 
-    let mut new_metadata = false;
-    let metadata = (*guard).entry(metadata_id).or_insert_with(|| {
-        new_metadata = true;
-        let metadata: Metadata<'static> = make_metadata_with_level(
-            name,
-            tracing_core::Level::INFO,
-            TryInto::<u32>::try_into(metadata_id).unwrap() * 5 + 100,
-        );
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ReplayFileError {
+    CannotOpenFile {
+        inner: io::Error,
+    },
+    CannotReadLine {
+        inner: io::Error,
+        line_index: usize,
+    },
+    CannotDeserializeRecord {
+        inner: serde_json::Error,
+        line_index: usize,
+        line: String,
+    },
+}
+
+impl fmt::Display for ReplayFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl error::Error for ReplayFileError {}
+
+impl Replay {
+    fn get_or_create_metadata(
+        &self,
+        rec_metadata: recording::Metadata,
+    ) -> &'static Metadata<'static> {
+        let mut guard = self.store.lock().unwrap();
+
+        let metadata: &'static Metadata = (*guard)
+            .entry(rec_metadata.id)
+            .or_insert_with(|| Box::leak(Box::new(rec_metadata.into())));
+
         metadata
-    });
-
-    let metadata: &'static Metadata = unsafe {
-        // I promise to never remove this item from the HashMap. This is not a real safety
-        // guarantee.
-        transmute::<&'_ Metadata<'static>, &'static Metadata<'static>>(metadata)
-    };
-
-    if new_metadata {
-        MetadataEntry::New(metadata)
-    } else {
-        MetadataEntry::Existing(metadata)
     }
-}
 
-fn write_event(metadata_id: u64, msg: &str, store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>) {
-    let _enabled = tracing::dispatcher::get_default(move |dispatch| {
-        let metadata = match metadata_or_create(metadata_id, "", &store.clone()) {
-            MetadataEntry::New(metadata) => {
-                dispatch.register_callsite(metadata);
-                metadata
-            }
-            MetadataEntry::Existing(metadata) => metadata,
-        };
-
-        let enabled = dispatch.enabled(metadata);
-        {
-            let fields = metadata.fields();
-            let message_field = fields.field("message").unwrap();
-            let values = [(&message_field, Some(&msg as &dyn field::Value))];
-            let value_set = metadata.fields().value_set(&values);
-            let event = Event::new(metadata, &value_set);
-            dispatch.event(&event);
+    fn dispatch_trace(&self, record: TraceRecord) {
+        match record.trace {
+            Trace::RegisterCallsite(rec_metadata) => self.register_callsite(rec_metadata),
+            Trace::Event(rec_event) => self.event(rec_event),
+            _ => {}
         }
+    }
 
-        enabled
-    });
-}
+    fn register_callsite(&self, rec_metadata: recording::Metadata) {
+        let metadata = self.get_or_create_metadata(rec_metadata);
+        tracing::dispatcher::get_default(move |dispatch| dispatch.register_callsite(metadata));
+    }
 
-fn new_span(
-    metadata_id: u64,
-    span_name: &'static str,
-    store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
-) -> span::Id {
-    tracing::dispatcher::get_default(move |dispatch| {
-        let metadata = match metadata_or_create(metadata_id, span_name, &store.clone()) {
-            MetadataEntry::New(metadata) => {
-                dispatch.register_callsite(metadata);
-                metadata
+    fn event(&self, rec_event: recording::Event) {
+        let metadata = self.get_or_create_metadata(rec_event.metadata);
+        tracing::dispatcher::get_default(move |dispatch| {
+            let enabled = dispatch.enabled(metadata);
+            if enabled {
+                let fields = metadata.fields();
+                let mut values = Vec::new();
+                let mut field_vec = Vec::new();
+                for (field_name, value) in &rec_event.fields {
+                    field_vec.push((fields.field(field_name), value));
+                }
+
+                for (field, value) in &field_vec {
+                    if let Some(field) = field {
+                        values.push((field, Some(value as &dyn field::Value)));
+                    }
+                }
+
+                let parent = &rec_event.parent;
+                match *values.as_slice() {
+                    [] => dispatch_event(dispatch, metadata, parent, []),
+                    [a] => dispatch_event(dispatch, metadata, parent, [a]),
+                    [a, b] => dispatch_event(dispatch, metadata, parent, [a, b]),
+                    [a, b, c] => dispatch_event(dispatch, metadata, parent, [a, b, c]),
+                    [a, b, c, d] => dispatch_event(dispatch, metadata, parent, [a, b, c, d]),
+                    [a, b, c, d, e] => dispatch_event(dispatch, metadata, parent, [a, b, c, d, e]),
+                    [a, b, c, d, e, f] => {
+                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f]);
+                    }
+                    [a, b, c, d, e, f, g] => {
+                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g]);
+                    }
+                    [a, b, c, d, e, f, g, h] => {
+                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g, h]);
+                    }
+                    [a, b, c, d, e, f, g, h, i, ..] => {
+                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g, h, i]);
+                    }
+                }
             }
-            MetadataEntry::Existing(metadata) => metadata,
-        };
-
-        let fields = metadata.fields();
-        let field = fields.field("field").unwrap();
-        let values = [(&field, Some(&"field-value" as &dyn field::Value))];
-        let value_set = metadata.fields().value_set(&values);
-
-        let span_id = tracing::dispatcher::get_default(move |dispatch| {
-            let span_attributes = Attributes::new(metadata, &value_set);
-            dispatch.new_span(&span_attributes)
         });
-
-        // let span = Span::new(metadata, &value_set);
-        // span.id().unwrap()
-
-        span_id
-    })
-}
-
-fn enter_span(span_id: &span::Id) {
-    tracing::dispatcher::get_default(|dispatch| dispatch.enter(span_id));
-}
-
-fn exit_span(span_id: &span::Id) {
-    tracing::dispatcher::get_default(|dispatch| dispatch.exit(span_id));
-}
-
-fn try_close_span(span_id: &span::Id) -> bool {
-    tracing::dispatcher::get_default(|dispatch| {
-        let span_id = span_id.clone();
-        dispatch.try_close(span_id)
-    })
-}
-
-fn make_metadata_with_level(
-    name: &'static str,
-    level: tracing_core::Level,
-    line_number: u32,
-) -> tracing::Metadata<'static> {
-    struct Cs;
-    impl Cs {
-        fn new() -> Self {
-            Cs
-        }
     }
-    impl tracing_core::Callsite for Cs {
-        fn set_interest(&self, _interest: tracing_core::Interest) {}
-        fn metadata(&self) -> &tracing_core::Metadata<'_> {
-            unimplemented!()
-        }
-    }
+}
 
-    let cs: &'static Cs = Box::leak(Box::new(Cs::new()));
-    tracing::Metadata::new(
-        name,
-        "doing-crimes",
-        level,
-        Some("src/crimes.rs"),
-        Some(line_number),
-        None,
-        tracing::field::FieldSet::new(&["message", "field"], tracing_core::identify_callsite!(cs)),
-        tracing::metadata::Kind::EVENT,
-    )
+fn dispatch_event<const N: usize>(
+    dispatch: &tracing::Dispatch,
+    metadata: &'static Metadata<'static>,
+    parent: &recording::Parent,
+    value: [(&field::Field, Option<&dyn tracing::Value>); N],
+) {
+    let value_set = metadata.fields().value_set(&value);
+    let event = match parent {
+        recording::Parent::Current => Event::new(metadata, &value_set),
+        recording::Parent::Root => Event::new_child_of(None, metadata, &value_set),
+        recording::Parent::Explicit(parent_id) => {
+            Event::new_child_of(Some(span::Id::from_u64(*parent_id)), metadata, &value_set)
+        }
+    };
+    dispatch.event(&event);
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<recording::Metadata> for Metadata<'static> {
+    fn from(val: recording::Metadata) -> Self {
+        let cs: &'static Cs = Box::leak(Box::new(Cs::new(val.id)));
+
+        // self.fields
+        let fields: Vec<&'static str> = val
+            .fields
+            .into_iter()
+            .map(|f| Box::leak(Box::new(f)) as &'static str)
+            .collect();
+
+        tracing::Metadata::new(
+            leak(val.name),
+            leak(val.target),
+            val.level.into(),
+            val.file.map(|s| leak(s) as &'static str),
+            val.line,
+            val.module_path.map(|s| leak(s) as &'static str),
+            tracing::field::FieldSet::new(leak(fields), tracing_core::identify_callsite!(cs)),
+            val.kind.into(),
+        )
+    }
+}
+
+fn leak<T>(obj: T) -> &'static T {
+    Box::leak(Box::new(obj))
 }
