@@ -1,0 +1,3 @@
+[workspace]
+members = ["tracing-cassette", "tracing-rec", "tracing-replay"]
+resolver = "2"

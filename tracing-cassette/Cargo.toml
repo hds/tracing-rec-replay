@@ -1,0 +1,16 @@
+[package]
+name = "tracing-cassette"
+version = "0.0.0"
+license = "MIT"
+edition = "2021"
+authors = ["Hayden Stainsby <hds@caffeineconcepts.com>"]
+readme = "README.md"
+homepage = "https://github.com/hds/tracing-rec-replay/tree/main/tracing-cassette"
+repository = "https://github.com/hds/tracing-rec-replay"
+description = """
+Store recordings of traces and pass them around like bootleg cassettes!. All that's missing is rewind.
+"""
+categories = ["development-tools::debugging"]
+keywords = ["tracing", "debugging"]
+
+[dependencies]
