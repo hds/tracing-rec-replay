@@ -1,4 +1,3 @@
-
 [workspace]
+members = ["tracing-cassette", "tracing-rec", "tracing-replay"]
 resolver = "2"
-members = [ "tracing-rec","tracing-replay"]
