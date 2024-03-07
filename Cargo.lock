@@ -227,6 +227,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-cassette"
+version = "0.0.1"
+
+[[package]]
 name = "tracing-core"
 version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -249,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "tracing-rec"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
