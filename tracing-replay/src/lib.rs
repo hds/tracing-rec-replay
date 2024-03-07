@@ -1,3 +1,59 @@
+//! Replay `tracing` recordings.
+//!
+//! # Overview
+//!
+//! The `tracing-replay` crate is the matching pair of the `tracing-rec` crate.
+//!
+//! `tracing-rec` provides a [`tracing-subscriber`] layer which can record event and span traces
+//! into a serialized format.
+//!
+//! `tracing-replay` can then take the serialized format and replay it into the current
+//! [`tracing`] dispatcher.
+//!
+//! # Usage
+//!
+//! The recorded traces from a file at a provided path will be replayed into the current
+//! [`Dispatch`].
+//!
+//! ```
+//! # let temp_dir = tempfile::tempdir().unwrap();
+//! # let path_buf = temp_dir.path().join("recording.tracing");
+//! # let recording_path = path_buf.to_str().unwrap();
+//! # {
+//! #    use std::io::Write;
+//! #    let mut file = std::fs::File::create(recording_path).unwrap();
+//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+//! # }
+//!
+//! let mut replay = tracing_replay::Replay::new();
+//! let result = replay.replay_file(recording_path);
+//!
+//! println!("{:?}", result);
+//! assert!(result.is_ok());
+//! # temp_dir.close().unwrap();
+//! ```
+//!
+//! # Supported Rust Versions
+//!
+//! `tracing-replay` is built against the latest stable release. The minimum supported version is
+//! 1.76. The current version of `tracing-replay` is not guaranteed to build on Rust versions
+//! earlier than the minimum supported version.
+//!
+//! # License
+//!
+//! This project is licensed under the [MIT license].
+//!
+//! [MIT license]: https://github.com/hds/tracing-rec-replay/blob/main/LICENSE
+//!
+//! # Contribution
+//!
+//! Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+//! in `tracing-replay` by you, shall be licensed as MIT, without any additional terms or
+//! conditions.
+//!
+//! [`Dispatch`]: struct@tracing::Dispatch
+//! [`tracing-subscriber`]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/
 #![allow(clippy::many_single_char_names)]
 
 use std::{
