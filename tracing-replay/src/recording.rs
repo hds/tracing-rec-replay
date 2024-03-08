@@ -9,12 +9,12 @@ pub(crate) struct TraceRecord {
 pub(crate) enum Trace {
     RegisterCallsite(Metadata),
     Event(Event),
-    NewSpan(serde_json::Value),
-    Enter(serde_json::Value),
-    Exit(serde_json::Value),
-    Close(serde_json::Value),
-    Record(serde_json::Value),
-    FollowsFrom(serde_json::Value),
+    NewSpan(NewSpan),
+    Enter(SpanId),
+    Exit(SpanId),
+    Close(SpanId),
+    Record(RecordValues),
+    FollowsFrom(FollowsFrom),
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,10 +75,32 @@ pub(crate) enum Parent {
     /// The new span has an explicitly-specified parent.
     Explicit(u64),
 }
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct Event {
     pub(crate) fields: Vec<(String, String)>,
     pub(crate) metadata: Metadata,
     pub(crate) parent: Parent,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct NewSpan {
+    pub(crate) id: SpanId,
+    pub(crate) fields: Vec<(String, String)>,
+    pub(crate) metadata: Metadata,
+    pub(crate) parent: Parent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Hash)]
+pub(crate) struct SpanId(u64);
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecordValues {
+    pub(crate) id: SpanId,
+    pub(crate) fields: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FollowsFrom {
+    pub(crate) cause_id: SpanId,
+    pub(crate) effect_id: SpanId,
 }

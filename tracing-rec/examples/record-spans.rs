@@ -5,7 +5,7 @@ fn main() {
         .with(tracing_rec::rec_layer())
         .init();
 
-    let info_span = tracing::info_span!("info-span", value_will_change = 15);
+    let info_span = tracing::info_span!("info-span", deferred_field = tracing::field::Empty);
     let _info_guard = info_span.enter();
 
     let enter_later = tracing::error_span!("enter-later");
@@ -23,7 +23,7 @@ fn main() {
 
     loopy(3);
 
-    info_span.record("value_will_change", 23);
+    info_span.record("deferred_field", 23);
 }
 
 #[tracing::instrument]
