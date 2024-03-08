@@ -64,14 +64,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing::span::Attributes;
-use tracing_core::{field, span, Event, Metadata};
+use proxy::{EventProxy, RecordProxy};
+use tracing_core::{field, span, Metadata};
 
 mod callsite;
+mod proxy;
 mod recording;
 
-use callsite::Cs;
-use recording::{Trace, TraceRecord};
+use crate::{
+    callsite::Cs,
+    proxy::{DispatchProxy, NewSpanProxy},
+    recording::{Trace, TraceRecord},
+};
 
 /// Replay coordinator.
 ///
@@ -263,40 +267,9 @@ impl Replay {
                 return;
             }
 
-            let fields = metadata.fields();
-            let mut values = Vec::new();
-            let mut field_vec = Vec::new();
-            for (field_name, value) in &rec_new_span.fields {
-                field_vec.push((fields.field(field_name), value));
-            }
-
-            for (field, value) in &field_vec {
-                if let Some(field) = field {
-                    values.push((field, Some(value as &dyn field::Value)));
-                }
-            }
-
-            let parent = &rec_new_span.parent;
-            let span_id = match *values.as_slice() {
-                [] => dispatch_new_span(dispatch, metadata, parent, []),
-                [a] => dispatch_new_span(dispatch, metadata, parent, [a]),
-                [a, b] => dispatch_new_span(dispatch, metadata, parent, [a, b]),
-                [a, b, c] => dispatch_new_span(dispatch, metadata, parent, [a, b, c]),
-                [a, b, c, d] => dispatch_new_span(dispatch, metadata, parent, [a, b, c, d]),
-                [a, b, c, d, e] => dispatch_new_span(dispatch, metadata, parent, [a, b, c, d, e]),
-                [a, b, c, d, e, f] => {
-                    dispatch_new_span(dispatch, metadata, parent, [a, b, c, d, e, f])
-                }
-                [a, b, c, d, e, f, g] => {
-                    dispatch_new_span(dispatch, metadata, parent, [a, b, c, d, e, f, g])
-                }
-                [a, b, c, d, e, f, g, h] => {
-                    dispatch_new_span(dispatch, metadata, parent, [a, b, c, d, e, f, g, h])
-                }
-                [a, b, c, d, e, f, g, h, i, ..] => {
-                    dispatch_new_span(dispatch, metadata, parent, [a, b, c, d, e, f, g, h, i])
-                }
-            };
+            let values = create_field_values(metadata, &rec_new_span.fields);
+            let proxy = NewSpanProxy::new(dispatch, metadata, &rec_new_span.parent);
+            let span_id = proxy.dispatch_values(values);
 
             // Store a mapping from the recorded span::Id to the one that `tracing` has given us
             // during this replay. We will need to look up this mapping to replay traces that
@@ -357,36 +330,10 @@ impl Replay {
             return;
         };
 
-        let fields = metadata.fields();
-        let mut values = Vec::new();
-        let mut field_vec = Vec::new();
-        for (field_name, value) in &rec_record_values.fields {
-            field_vec.push((fields.field(field_name), value));
-        }
-
-        for (field, value) in &field_vec {
-            if let Some(field) = field {
-                values.push((field, Some(value as &dyn field::Value)));
-            }
-        }
-
-        tracing::dispatcher::get_default(move |dispatch| match *values.as_slice() {
-            [] => dispatch_record(dispatch, metadata, &span_id, []),
-            [a] => dispatch_record(dispatch, metadata, &span_id, [a]),
-            [a, b] => dispatch_record(dispatch, metadata, &span_id, [a, b]),
-            [a, b, c] => dispatch_record(dispatch, metadata, &span_id, [a, b, c]),
-            [a, b, c, d] => dispatch_record(dispatch, metadata, &span_id, [a, b, c, d]),
-            [a, b, c, d, e] => dispatch_record(dispatch, metadata, &span_id, [a, b, c, d, e]),
-            [a, b, c, d, e, f] => dispatch_record(dispatch, metadata, &span_id, [a, b, c, d, e, f]),
-            [a, b, c, d, e, f, g] => {
-                dispatch_record(dispatch, metadata, &span_id, [a, b, c, d, e, f, g]);
-            }
-            [a, b, c, d, e, f, g, h] => {
-                dispatch_record(dispatch, metadata, &span_id, [a, b, c, d, e, f, g, h]);
-            }
-            [a, b, c, d, e, f, g, h, i, ..] => {
-                dispatch_record(dispatch, metadata, &span_id, [a, b, c, d, e, f, g, h, i]);
-            }
+        tracing::dispatcher::get_default(move |dispatch| {
+            let values = create_field_values(metadata, &rec_record_values.fields);
+            let proxy = RecordProxy::new(dispatch, metadata, &span_id);
+            proxy.dispatch_values(values);
         });
     }
 
@@ -395,40 +342,9 @@ impl Replay {
         tracing::dispatcher::get_default(move |dispatch| {
             let enabled = dispatch.enabled(metadata);
             if enabled {
-                let fields = metadata.fields();
-                let mut values = Vec::new();
-                let mut field_vec = Vec::new();
-                for (field_name, value) in &rec_event.fields {
-                    field_vec.push((fields.field(field_name), value));
-                }
-
-                for (field, value) in &field_vec {
-                    if let Some(field) = field {
-                        values.push((field, Some(value as &dyn field::Value)));
-                    }
-                }
-
-                let parent = &rec_event.parent;
-                match *values.as_slice() {
-                    [] => dispatch_event(dispatch, metadata, parent, []),
-                    [a] => dispatch_event(dispatch, metadata, parent, [a]),
-                    [a, b] => dispatch_event(dispatch, metadata, parent, [a, b]),
-                    [a, b, c] => dispatch_event(dispatch, metadata, parent, [a, b, c]),
-                    [a, b, c, d] => dispatch_event(dispatch, metadata, parent, [a, b, c, d]),
-                    [a, b, c, d, e] => dispatch_event(dispatch, metadata, parent, [a, b, c, d, e]),
-                    [a, b, c, d, e, f] => {
-                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f]);
-                    }
-                    [a, b, c, d, e, f, g] => {
-                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g]);
-                    }
-                    [a, b, c, d, e, f, g, h] => {
-                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g, h]);
-                    }
-                    [a, b, c, d, e, f, g, h, i, ..] => {
-                        dispatch_event(dispatch, metadata, parent, [a, b, c, d, e, f, g, h, i]);
-                    }
-                }
+                let values = create_field_values(metadata, &rec_event.fields);
+                let proxy = EventProxy::new(dispatch, metadata, &rec_event.parent);
+                proxy.dispatch_values(values);
             }
         });
     }
@@ -442,55 +358,23 @@ impl Replay {
     }
 }
 
-fn dispatch_event<const N: usize>(
-    dispatch: &tracing::Dispatch,
-    metadata: &'static Metadata<'static>,
-    parent: &recording::Parent,
-    value: [(&field::Field, Option<&dyn tracing::Value>); N],
-) {
-    let value_set = metadata.fields().value_set(&value);
-    let event = match parent {
-        recording::Parent::Current => Event::new(metadata, &value_set),
-        recording::Parent::Root => Event::new_child_of(None, metadata, &value_set),
-        recording::Parent::Explicit(parent_id) => {
-            Event::new_child_of(Some(span::Id::from_u64(*parent_id)), metadata, &value_set)
-        }
-    };
-    dispatch.event(&event);
-}
-
-fn dispatch_new_span<const N: usize>(
-    dispatch: &tracing::Dispatch,
-    metadata: &'static Metadata<'static>,
-    parent: &recording::Parent,
-    value: [(&field::Field, Option<&dyn tracing::Value>); N],
-) -> span::Id {
-    let value_set = metadata.fields().value_set(&value);
-    let attr = match parent {
-        recording::Parent::Current => Attributes::new(metadata, &value_set),
-        recording::Parent::Root => Attributes::new_root(metadata, &value_set),
-        &recording::Parent::Explicit(parent_id) => {
-            Attributes::child_of(span::Id::from_u64(parent_id), metadata, &value_set)
-        }
-    };
-    dispatch.new_span(&attr)
-}
-
-fn dispatch_record<const N: usize>(
-    dispatch: &tracing::Dispatch,
-    metadata: &'static Metadata<'static>,
-    span_id: &span::Id,
-    value: [(&field::Field, Option<&dyn tracing::Value>); N],
-) {
-    let value_set = metadata.fields().value_set(&value);
-    let record = span::Record::new(&value_set);
-    dispatch.record(span_id, &record);
-}
-
 impl Default for Replay {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn create_field_values<'a>(
+    metadata: &'static Metadata,
+    rec_fields: &'a [(String, String)],
+) -> Vec<(field::Field, Option<&'a dyn tracing::Value>)> {
+    let fields = metadata.fields();
+    rec_fields
+        .iter()
+        .filter_map(|(field_name, value)| {
+            Some((fields.field(field_name)?, Some(value as &dyn field::Value)))
+        })
+        .collect()
 }
 
 impl From<recording::Metadata> for Metadata<'static> {
@@ -520,34 +404,3 @@ impl From<recording::Metadata> for Metadata<'static> {
 fn leak<T>(obj: T) -> &'static T {
     Box::leak(Box::new(obj))
 }
-
-// fn new_span(
-//     metadata_id: u64,
-//     span_name: &'static str,
-//     store: Arc<Mutex<HashMap<u64, Metadata<'static>>>>,
-// ) -> span::Id {
-//     tracing::dispatcher::get_default(move |dispatch| {
-//         let metadata = match metadata_or_create(metadata_id, span_name, &store.clone()) {
-//             MetadataEntry::New(metadata) => {
-//                 dispatch.register_callsite(metadata);
-//                 metadata
-//             }
-//             MetadataEntry::Existing(metadata) => metadata,
-//         };
-
-//         let fields = metadata.fields();
-//         let field = fields.field("field").unwrap();
-//         let values = [(&field, Some(&"field-value" as &dyn field::Value))];
-//         let value_set = metadata.fields().value_set(&values);
-
-//         let span_id = tracing::dispatcher::get_default(move |dispatch| {
-//             let span_attributes = Attributes::new(metadata, &value_set);
-//             dispatch.new_span(&span_attributes)
-//         });
-
-//         // let span = Span::new(metadata, &value_set);
-//         // span.id().unwrap()
-
-//         span_id
-//     })
-// }
