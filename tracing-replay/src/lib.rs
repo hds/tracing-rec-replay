@@ -29,7 +29,6 @@
 //! let mut replay = tracing_replay::Replay::new();
 //! let result = replay.replay_file(recording_path);
 //!
-//! println!("{:?}", result);
 //! assert!(result.is_ok());
 //! # temp_dir.close().unwrap();
 //! ```
@@ -57,11 +56,14 @@
 #![allow(clippy::many_single_char_names)]
 
 use std::{
+    any::Any,
     collections::HashMap,
     error, fmt,
     fs::File,
     io::{self, BufReader},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
+    thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use proxy::{EventProxy, RecordProxy};
@@ -87,7 +89,14 @@ use crate::{
 pub struct Replay {
     store: Arc<Mutex<HashMap<u64, &'static Metadata<'static>>>>,
     callsites: Arc<Mutex<HashMap<recording::SpanId, u64>>>,
-    span_ids: Arc<Mutex<HashMap<recording::SpanId, span::Id>>>,
+    span_ids: Arc<Mutex<HashMap<recording::SpanId, MappedSpanId>>>,
+    threads: HashMap<String, ThreadDispatcherHandle>,
+}
+
+#[derive(Debug)]
+enum MappedSpanId {
+    Pending,
+    Mapped(span::Id),
 }
 
 impl Replay {
@@ -97,6 +106,7 @@ impl Replay {
             store: Arc::new(Mutex::new(HashMap::new())),
             callsites: Arc::new(Mutex::new(HashMap::new())),
             span_ids: Arc::new(Mutex::new(HashMap::new())),
+            threads: HashMap::new(),
         }
     }
 
@@ -125,8 +135,6 @@ impl Replay {
     ///
     /// let mut replay = tracing_replay::Replay::new();
     /// let result = replay.replay_file(recording_path);
-    ///
-    /// println!("{:?}", result);
     /// assert!(result.is_ok());
     /// # temp_dir.close().unwrap();
     /// ```
@@ -156,6 +164,62 @@ impl Replay {
         }
 
         Ok(ReplaySummary { record_count })
+    }
+
+    /// Close the replay and check for errors.
+    ///
+    /// Since much of the work of replaying a [`tracing`] recording happens on other threads, work
+    /// may be ongoing when [`replay_file`] returns. This is desireable in the case that another
+    /// file constituting more traces from the same recording is to be replayed directly
+    /// afterwards.
+    ///
+    /// Calling this method waits for the dispatcher threads to complete and then tears them down.
+    ///
+    /// # Errors
+    ///
+    /// If any of the dispatcher threads panicked, the resulting messages are returned in
+    /// `ReplayCloseError`. All errors are collected into a vec together with their
+    /// recording thread Id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let temp_dir = tempfile::tempdir().unwrap();
+    /// # let path_buf = temp_dir.path().join("recording.tracing");
+    /// # let recording_path = path_buf.to_str().unwrap();
+    /// # {
+    /// #    use std::io::Write;
+    /// #    let mut file = std::fs::File::create(recording_path).unwrap();
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+    /// # }
+    ///
+    /// let mut replay = tracing_replay::Replay::new();
+    /// let _replay_result = replay.replay_file(recording_path);
+    ///
+    /// let close_result = replay.close();
+    /// assert!(close_result.is_ok());
+    /// # temp_dir.close().unwrap();
+    /// ```
+    pub fn close(&mut self) -> Result<(), ReplayCloseError> {
+        let mut errors = Vec::new();
+        for (key, handle) in self.threads.drain() {
+            match handle.trace_tx.send(DispatchableContainer::End) {
+                Ok(()) => match handle.join_handle.join() {
+                    Ok(()) => {}
+                    Err(join_error) => errors.push((key, join_error)),
+                },
+                Err(send_error) => {
+                    errors.push((key, Box::new(send_error)));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ReplayCloseError { threads: errors })
+        }
     }
 }
 
@@ -189,6 +253,30 @@ impl fmt::Display for ReplayFileError {
 }
 
 impl error::Error for ReplayFileError {}
+
+#[derive(Debug)]
+pub struct ReplayCloseError {
+    threads: Vec<(String, Box<dyn Any + Send + 'static>)>,
+}
+
+impl fmt::Display for ReplayCloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ReplayCloseError:")?;
+        for (thread_id, error) in &self.threads {
+            write!(f, " - {thread_id}: {error:?}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl error::Error for ReplayCloseError {}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Replay {
     fn get_or_create_metadata(
@@ -237,131 +325,338 @@ impl Replay {
         (*guard).get(&callsite_id).copied()
     }
 
-    fn dispatch_trace(&self, record: TraceRecord) {
-        match record.trace {
-            Trace::RegisterCallsite(rec_metadata) => self.register_callsite(rec_metadata),
-            Trace::Event(rec_event) => self.event(rec_event),
-            Trace::NewSpan(rec_new_span) => self.new_span(rec_new_span),
-            Trace::Enter(rec_span_id) => self.enter_span(rec_span_id),
-            Trace::Exit(rec_span_id) => self.exit_span(rec_span_id),
-            Trace::Close(rec_span_id) => {
-                self.try_close_span(rec_span_id);
+    fn dispatch_trace(&mut self, record: TraceRecord) {
+        let trace_tx = {
+            let handle = self
+                .threads
+                .entry(record.meta.thread_id)
+                .or_insert_with_key(|thread_id| {
+                    let (tx, rx) = mpsc::channel();
+                    let thread_dispatcher = ThreadDispatcher {
+                        rec_id: thread_id.clone(),
+                        trace_rx: rx,
+                        span_ids: Arc::clone(&self.span_ids),
+                    };
+                    let join_handle = thread::Builder::new()
+                        .name(record.meta.thread_name.unwrap_or_default())
+                        .spawn(move || {
+                            thread_dispatcher.run();
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "failed to create replay thread '{thread_id}'. \
+                                Cannot faithfully reproduce traces. Error: {err}"
+                            );
+                        });
+                    ThreadDispatcherHandle {
+                        trace_tx: tx,
+                        join_handle,
+                    }
+                });
+            handle.trace_tx.clone()
+        };
+
+        let timestamp = Instant::now();
+        let container = match record.trace {
+            Trace::RegisterCallsite(rec_metadata) => {
+                let metadata = self.get_or_create_metadata(rec_metadata);
+                DispatchableContainer::Trace {
+                    timestamp,
+                    trace: DispatchableTrace::RegisterCallsite(DispatchableMetadata(metadata)),
+                }
             }
-            Trace::FollowsFrom(rec_follows_from) => self.follows_from(&rec_follows_from),
-            Trace::Record(rec_record_values) => self.record_values(&rec_record_values),
-        }
+            Trace::Event(rec_event) => {
+                let dis_event = self.event(rec_event);
+                DispatchableContainer::Trace {
+                    timestamp,
+                    trace: DispatchableTrace::Event(dis_event),
+                }
+            }
+            Trace::NewSpan(rec_new_span) => {
+                let dis_new_span = self.new_span(rec_new_span);
+                DispatchableContainer::Trace {
+                    timestamp,
+                    trace: DispatchableTrace::NewSpan(dis_new_span),
+                }
+            }
+            Trace::Enter(rec_span_id) => DispatchableContainer::Trace {
+                timestamp,
+                trace: DispatchableTrace::Enter(DispatchableSpanId(rec_span_id)),
+            },
+            Trace::Exit(rec_span_id) => DispatchableContainer::Trace {
+                timestamp,
+                trace: DispatchableTrace::Exit(DispatchableSpanId(rec_span_id)),
+            },
+            Trace::Close(rec_span_id) => DispatchableContainer::Trace {
+                timestamp,
+                trace: DispatchableTrace::Close(DispatchableSpanId(rec_span_id)),
+            },
+            Trace::Record(rec_record_values) => {
+                let Some(metadata) = self.get_metadata_by_span_id(rec_record_values.id) else {
+                    return;
+                };
+                DispatchableContainer::Trace {
+                    timestamp,
+                    trace: DispatchableTrace::Record(DispatchableRecordValues {
+                        id: rec_record_values.id,
+                        metadata,
+                        fields: rec_record_values.fields,
+                    }),
+                }
+            }
+            Trace::FollowsFrom(rec_follows_from) => DispatchableContainer::Trace {
+                timestamp,
+                trace: DispatchableTrace::FollowsFrom(DispatchableFollowsFrom {
+                    cause_id: rec_follows_from.cause_id,
+                    effect_id: rec_follows_from.effect_id,
+                }),
+            },
+        };
+        if let Err(err) = trace_tx.send(container) {
+            println!("failed to send container: {err}");
+        };
     }
 
-    fn register_callsite(&self, rec_metadata: recording::Metadata) {
-        let metadata = self.get_or_create_metadata(rec_metadata);
-        tracing::dispatcher::get_default(move |dispatch| dispatch.register_callsite(metadata));
-    }
-
-    fn new_span(&self, rec_new_span: recording::NewSpan) {
+    fn new_span(&self, rec_new_span: recording::NewSpan) -> DispatchableNewSpan {
         let callsite_id = rec_new_span.metadata.id;
         let metadata = self.get_or_create_metadata(rec_new_span.metadata);
         self.set_span_id_callsite(rec_new_span.id, callsite_id);
 
-        tracing::dispatcher::get_default(move |dispatch| {
-            if !dispatch.enabled(metadata) {
-                return;
-            }
+        {
+            let mut guard = self
+                .span_ids
+                .lock()
+                .expect("replay internal state has become corrupted.");
+            debug_assert!(
+                (*guard).get(&rec_new_span.id).is_none(),
+                "new span recorded span::Id that has already been seen!"
+            );
+            (*guard).insert(rec_new_span.id, MappedSpanId::Pending);
+        }
 
-            let values = create_field_values(metadata, &rec_new_span.fields);
-            let proxy = NewSpanProxy::new(dispatch, metadata, &rec_new_span.parent);
-            let span_id = proxy.dispatch_values(values);
-
-            // Store a mapping from the recorded span::Id to the one that `tracing` has given us
-            // during this replay. We will need to look up this mapping to replay traces that
-            // reference this new span by Id (enter, exit, ...).
-            {
-                let mut guard = self
-                    .span_ids
-                    .lock()
-                    .expect("replay internal state has become corrupted.");
-                debug_assert!(
-                    (*guard).get(&rec_new_span.id).is_none(),
-                    "new span recorded span::Id that has already been seen!"
-                );
-                (*guard).insert(rec_new_span.id, span_id);
-            }
-        });
+        DispatchableNewSpan {
+            id: rec_new_span.id,
+            metadata,
+            fields: rec_new_span.fields,
+            parent: rec_new_span.parent,
+        }
     }
 
-    fn enter_span(&self, rec_span_id: recording::SpanId) {
-        let span_id = self
-            .get_replay_span_id(rec_span_id)
-            .expect("no replay span::Id found, is the recording complete?");
-        tracing::dispatcher::get_default(|dispatch| dispatch.enter(&span_id));
-    }
-
-    fn exit_span(&self, rec_span_id: recording::SpanId) {
-        let span_id = self
-            .get_replay_span_id(rec_span_id)
-            .expect("no replay span::Id found, is the recording complete?");
-
-        tracing::dispatcher::get_default(|dispatch| dispatch.exit(&span_id));
-    }
-
-    fn try_close_span(&self, rec_span_id: recording::SpanId) -> bool {
-        let span_id = self
-            .get_replay_span_id(rec_span_id)
-            .expect("no replay span::Id found, is the recording complete?");
-        tracing::dispatcher::get_default(move |dispatch| dispatch.try_close(span_id.clone()))
-    }
-
-    fn follows_from(&self, rec_follows_from: &recording::FollowsFrom) {
-        let Some(cause_span_id) = self.get_replay_span_id(rec_follows_from.cause_id) else {
-            return;
-        };
-        let Some(effect_span_id) = self.get_replay_span_id(rec_follows_from.effect_id) else {
-            return;
-        };
-        tracing::dispatcher::get_default(move |dispatch| {
-            dispatch.record_follows_from(&effect_span_id, &cause_span_id);
-        });
-    }
-
-    fn record_values(&self, rec_record_values: &recording::RecordValues) {
-        let Some(span_id) = self.get_replay_span_id(rec_record_values.id) else {
-            return;
-        };
-        let Some(metadata) = self.get_metadata_by_span_id(rec_record_values.id) else {
-            return;
-        };
-
-        tracing::dispatcher::get_default(move |dispatch| {
-            let values = create_field_values(metadata, &rec_record_values.fields);
-            let proxy = RecordProxy::new(dispatch, metadata, &span_id);
-            proxy.dispatch_values(values);
-        });
-    }
-
-    fn event(&self, rec_event: recording::Event) {
+    fn event(&self, rec_event: recording::Event) -> DispatchableEvent {
         let metadata = self.get_or_create_metadata(rec_event.metadata);
-        tracing::dispatcher::get_default(move |dispatch| {
-            let enabled = dispatch.enabled(metadata);
-            if enabled {
-                let values = create_field_values(metadata, &rec_event.fields);
-                let proxy = EventProxy::new(dispatch, metadata, &rec_event.parent);
-                proxy.dispatch_values(values);
-            }
-        });
-    }
-
-    fn get_replay_span_id(&self, rec_span_id: recording::SpanId) -> Option<span::Id> {
-        let guard = self
-            .span_ids
-            .lock()
-            .expect("replay internal state has become corrupted.");
-        (*guard).get(&rec_span_id).cloned()
+        DispatchableEvent {
+            metadata,
+            fields: rec_event.fields,
+            parent: rec_event.parent,
+        }
     }
 }
 
-impl Default for Replay {
-    fn default() -> Self {
-        Self::new()
+#[derive(Debug)]
+enum DispatchableContainer {
+    Trace {
+        timestamp: Instant,
+        trace: DispatchableTrace,
+    },
+    End,
+}
+
+#[derive(Debug)]
+enum DispatchableTrace {
+    RegisterCallsite(DispatchableMetadata),
+    Event(DispatchableEvent),
+    NewSpan(DispatchableNewSpan),
+    Enter(DispatchableSpanId),
+    Exit(DispatchableSpanId),
+    Close(DispatchableSpanId),
+    Record(DispatchableRecordValues),
+    FollowsFrom(DispatchableFollowsFrom),
+}
+
+#[derive(Debug)]
+struct DispatchableMetadata(&'static Metadata<'static>);
+
+impl DispatchableMetadata {
+    fn into_inner(self) -> &'static Metadata<'static> {
+        self.0
     }
+}
+
+#[derive(Debug)]
+struct DispatchableEvent {
+    metadata: &'static Metadata<'static>,
+    fields: Vec<(String, String)>,
+    parent: recording::Parent,
+}
+
+#[derive(Debug)]
+struct DispatchableNewSpan {
+    id: recording::SpanId,
+    metadata: &'static Metadata<'static>,
+    fields: Vec<(String, String)>,
+    parent: recording::Parent,
+}
+
+#[derive(Debug)]
+struct DispatchableSpanId(recording::SpanId);
+
+impl DispatchableSpanId {
+    fn into_inner(self) -> recording::SpanId {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+struct DispatchableFollowsFrom {
+    cause_id: recording::SpanId,
+    effect_id: recording::SpanId,
+}
+
+#[derive(Debug)]
+pub(crate) struct DispatchableRecordValues {
+    id: recording::SpanId,
+    metadata: &'static Metadata<'static>,
+    fields: Vec<(String, String)>,
+}
+
+struct ThreadDispatcher {
+    rec_id: String,
+    trace_rx: mpsc::Receiver<DispatchableContainer>,
+    span_ids: Arc<Mutex<HashMap<recording::SpanId, MappedSpanId>>>,
+}
+
+impl ThreadDispatcher {
+    fn run(self) {
+        let rec_id = &self.rec_id;
+        loop {
+            match self.trace_rx.recv() {
+                Ok(DispatchableContainer::Trace { timestamp, trace }) => {
+                    self.dispatch(timestamp, trace);
+                }
+                Ok(DispatchableContainer::End) => break,
+                Err(err) => {
+                    println!("rec_id={rec_id}: Got error: {err}.");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn dispatch(&self, _timestamp: Instant, trace: DispatchableTrace) {
+        // TODO(hds): Wait for timestamp to arrive
+        match trace {
+            DispatchableTrace::RegisterCallsite(dis_metadata) => {
+                let metadata = dis_metadata.into_inner();
+                tracing::dispatcher::get_default(move |dispatch| {
+                    dispatch.register_callsite(metadata);
+                });
+            }
+            DispatchableTrace::Event(dis_event) => {
+                tracing::dispatcher::get_default(move |dispatch| {
+                    let enabled = dispatch.enabled(dis_event.metadata);
+                    if enabled {
+                        let values = create_field_values(dis_event.metadata, &dis_event.fields);
+                        let proxy =
+                            EventProxy::new(dispatch, dis_event.metadata, &dis_event.parent);
+                        proxy.dispatch_values(values);
+                    }
+                });
+            }
+            DispatchableTrace::NewSpan(dis_new_span) => {
+                tracing::dispatcher::get_default(move |dispatch| {
+                    if !dispatch.enabled(dis_new_span.metadata) {
+                        return;
+                    }
+
+                    let values = create_field_values(dis_new_span.metadata, &dis_new_span.fields);
+                    let proxy =
+                        NewSpanProxy::new(dispatch, dis_new_span.metadata, &dis_new_span.parent);
+                    let span_id = proxy.dispatch_values(values);
+
+                    // Store a mapping from the recorded span::Id to the one that `tracing` has given us
+                    // during this replay. We will need to look up this mapping to replay traces that
+                    // reference this new span by Id (enter, exit, ...).
+                    {
+                        let mut guard = self
+                            .span_ids
+                            .lock()
+                            .expect("replay internal state has become corrupted.");
+
+                        // TODO(hds): This should check that the entry is exactly Some(MappedSpanId::Pending) and nothing else.
+                        let current_value = (*guard).get(&dis_new_span.id);
+                        debug_assert!(
+                            matches!((*guard).get(&dis_new_span.id), Some(MappedSpanId::Pending)),
+                            "new span recorded span::Id should be Pending, but is {current_value:?}",
+                        );
+                        (*guard).insert(dis_new_span.id, MappedSpanId::Mapped(span_id));
+                    }
+                });
+            }
+            DispatchableTrace::Enter(dis_span_id) => {
+                let span_id = self
+                    .get_replay_span_id(dis_span_id.into_inner())
+                    .expect("no replay span::Id found, is the recording complete?");
+                tracing::dispatcher::get_default(|dispatch| dispatch.enter(&span_id));
+            }
+            DispatchableTrace::Exit(dis_span_id) => {
+                let span_id = self
+                    .get_replay_span_id(dis_span_id.into_inner())
+                    .expect("no replay span::Id found, is the recording complete?");
+                tracing::dispatcher::get_default(|dispatch| dispatch.exit(&span_id));
+            }
+            DispatchableTrace::Close(dis_span_id) => {
+                let span_id = self
+                    .get_replay_span_id(dis_span_id.into_inner())
+                    .expect("no replay span::Id found, is the recording complete?");
+                tracing::dispatcher::get_default(|dispatch| dispatch.try_close(span_id.clone()));
+            }
+            DispatchableTrace::Record(dis_record_values) => {
+                let Some(span_id) = self.get_replay_span_id(dis_record_values.id) else {
+                    return;
+                };
+
+                tracing::dispatcher::get_default(move |dispatch| {
+                    let values =
+                        create_field_values(dis_record_values.metadata, &dis_record_values.fields);
+                    let proxy = RecordProxy::new(dispatch, dis_record_values.metadata, &span_id);
+                    proxy.dispatch_values(values);
+                });
+            }
+            DispatchableTrace::FollowsFrom(dis_follows_from) => {
+                let Some(cause_span_id) = self.get_replay_span_id(dis_follows_from.cause_id) else {
+                    return;
+                };
+                let Some(effect_span_id) = self.get_replay_span_id(dis_follows_from.effect_id)
+                else {
+                    return;
+                };
+                tracing::dispatcher::get_default(move |dispatch| {
+                    dispatch.record_follows_from(&effect_span_id, &cause_span_id);
+                });
+            }
+        }
+    }
+
+    fn get_replay_span_id(&self, rec_span_id: recording::SpanId) -> Option<span::Id> {
+        loop {
+            let guard = self
+                .span_ids
+                .lock()
+                .expect("replay internal state has become corrupted.");
+
+            match (*guard).get(&rec_span_id) {
+                Some(MappedSpanId::Pending) => {} // Spin lock, it must be coming soon!
+                Some(MappedSpanId::Mapped(span_id)) => break Some(span_id.clone()),
+                None => break None,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThreadDispatcherHandle {
+    join_handle: JoinHandle<()>,
+    trace_tx: mpsc::Sender<DispatchableContainer>,
 }
 
 fn create_field_values<'a>(

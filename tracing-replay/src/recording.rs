@@ -2,7 +2,14 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TraceRecord {
+    pub(crate) meta: RecordMeta,
     pub(crate) trace: Trace,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecordMeta {
+    pub(crate) thread_id: String,
+    pub(crate) thread_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
