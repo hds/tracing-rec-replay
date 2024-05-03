@@ -63,7 +63,7 @@ use std::{
     io::{self, BufReader},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use proxy::{EventProxy, RecordProxy};
@@ -91,6 +91,7 @@ pub struct Replay {
     callsites: Arc<Mutex<HashMap<recording::SpanId, u64>>>,
     span_ids: Arc<Mutex<HashMap<recording::SpanId, MappedSpanId>>>,
     threads: HashMap<String, ThreadDispatcherHandle>,
+    replay_time_delta: Duration,
 }
 
 #[derive(Debug)]
@@ -107,6 +108,7 @@ impl Replay {
             callsites: Arc::new(Mutex::new(HashMap::new())),
             span_ids: Arc::new(Mutex::new(HashMap::new())),
             threads: HashMap::new(),
+            replay_time_delta: Duration::from_nanos(0),
         }
     }
 
@@ -151,13 +153,25 @@ impl Replay {
                 inner: io_err,
                 line_index,
             })?;
-            let trace_record = serde_json::from_str(line).map_err(|err| {
+            let trace_record: TraceRecord = serde_json::from_str(line).map_err(|err| {
                 ReplayFileError::CannotDeserializeRecord {
                     inner: err,
                     line_index,
                     line: line.clone(),
                 }
             })?;
+
+            if line_index == 0 {
+                let now_since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                let recording_since_epoch = Duration::new(
+                    trace_record.meta.timestamp_s,
+                    trace_record.meta.timestamp_subsec_us,
+                );
+
+                // Set the delta between now and the recording time. We'll use this to delay
+                // replays and make them run on the same schedule as the recording.
+                self.replay_time_delta = now_since_epoch.saturating_sub(recording_since_epoch);
+            }
 
             self.dispatch_trace(trace_record);
             record_count += 1;
@@ -356,39 +370,44 @@ impl Replay {
             handle.trace_tx.clone()
         };
 
-        let timestamp = Instant::now();
+        let record_since_epoch =
+            Duration::new(record.meta.timestamp_s, record.meta.timestamp_subsec_us);
+        let replay_since_epoch = record_since_epoch
+            .checked_add(self.replay_time_delta)
+            .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+
         let container = match record.trace {
             Trace::RegisterCallsite(rec_metadata) => {
                 let metadata = self.get_or_create_metadata(rec_metadata);
                 DispatchableContainer::Trace {
-                    timestamp,
+                    timestamp: replay_since_epoch,
                     trace: DispatchableTrace::RegisterCallsite(DispatchableMetadata(metadata)),
                 }
             }
             Trace::Event(rec_event) => {
                 let dis_event = self.event(rec_event);
                 DispatchableContainer::Trace {
-                    timestamp,
+                    timestamp: replay_since_epoch,
                     trace: DispatchableTrace::Event(dis_event),
                 }
             }
             Trace::NewSpan(rec_new_span) => {
                 let dis_new_span = self.new_span(rec_new_span);
                 DispatchableContainer::Trace {
-                    timestamp,
+                    timestamp: replay_since_epoch,
                     trace: DispatchableTrace::NewSpan(dis_new_span),
                 }
             }
             Trace::Enter(rec_span_id) => DispatchableContainer::Trace {
-                timestamp,
+                timestamp: replay_since_epoch,
                 trace: DispatchableTrace::Enter(DispatchableSpanId(rec_span_id)),
             },
             Trace::Exit(rec_span_id) => DispatchableContainer::Trace {
-                timestamp,
+                timestamp: replay_since_epoch,
                 trace: DispatchableTrace::Exit(DispatchableSpanId(rec_span_id)),
             },
             Trace::Close(rec_span_id) => DispatchableContainer::Trace {
-                timestamp,
+                timestamp: replay_since_epoch,
                 trace: DispatchableTrace::Close(DispatchableSpanId(rec_span_id)),
             },
             Trace::Record(rec_record_values) => {
@@ -396,7 +415,7 @@ impl Replay {
                     return;
                 };
                 DispatchableContainer::Trace {
-                    timestamp,
+                    timestamp: replay_since_epoch,
                     trace: DispatchableTrace::Record(DispatchableRecordValues {
                         id: rec_record_values.id,
                         metadata,
@@ -405,7 +424,7 @@ impl Replay {
                 }
             }
             Trace::FollowsFrom(rec_follows_from) => DispatchableContainer::Trace {
-                timestamp,
+                timestamp: replay_since_epoch,
                 trace: DispatchableTrace::FollowsFrom(DispatchableFollowsFrom {
                     cause_id: rec_follows_from.cause_id,
                     effect_id: rec_follows_from.effect_id,
@@ -455,7 +474,7 @@ impl Replay {
 #[derive(Debug)]
 enum DispatchableContainer {
     Trace {
-        timestamp: Instant,
+        timestamp: Duration,
         trace: DispatchableTrace,
     },
     End,
@@ -542,8 +561,12 @@ impl ThreadDispatcher {
         }
     }
 
-    fn dispatch(&self, _timestamp: Instant, trace: DispatchableTrace) {
-        // TODO(hds): Wait for timestamp to arrive
+    fn dispatch(&self, timestamp: Duration, trace: DispatchableTrace) {
+        let delay = timestamp.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+
         match trace {
             DispatchableTrace::RegisterCallsite(dis_metadata) => {
                 let metadata = dis_metadata.into_inner();

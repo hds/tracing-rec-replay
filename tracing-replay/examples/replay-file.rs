@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         .with_span_events(FmtSpan::FULL);
     tracing_subscriber::registry().with(layer).init();
 
-    let Some(path) = env::args().skip(1).next() else {
+    let Some(path) = env::args().nth(1) else {
         return Err(
             "error: no recording filename provided. usage: replay-file <recording_file>".into(),
         );

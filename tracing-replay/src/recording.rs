@@ -8,6 +8,8 @@ pub(crate) struct TraceRecord {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RecordMeta {
+    pub(crate) timestamp_s: u64,
+    pub(crate) timestamp_subsec_us: u32,
     pub(crate) thread_id: String,
     pub(crate) thread_name: Option<String>,
 }
