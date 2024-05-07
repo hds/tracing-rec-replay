@@ -6,7 +6,6 @@
 //!
 //! `tracing-rec` provides a [`tracing-subscriber`] layer which can record event and span traces
 //! into a serialized format.
-//!
 //! `tracing-replay` can then take the serialized format and replay it into the current
 //! [`tracing`] dispatcher.
 //!
@@ -22,8 +21,8 @@
 //! # {
 //! #    use std::io::Write;
 //! #    let mut file = std::fs::File::create(recording_path).unwrap();
-//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
-//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543400,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+//! #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543496,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[{"name":"message","value":{"Debug":"I am an info event!"}}],"metadata":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
 //! # }
 //!
 //! let mut replay = tracing_replay::Replay::new();
@@ -76,7 +75,7 @@ mod recording;
 use crate::{
     callsite::Cs,
     proxy::{DispatchProxy, NewSpanProxy},
-    recording::{Trace, TraceRecord},
+    recording::{Field, Trace, TraceRecord},
 };
 
 /// Replay coordinator.
@@ -131,8 +130,8 @@ impl Replay {
     /// # {
     /// #    use std::io::Write;
     /// #    let mut file = std::fs::File::create(recording_path).unwrap();
-    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
-    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543400,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543496,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[{"name":"message","value":{"Debug":"I am an info event!"}}],"metadata":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
     /// # }
     ///
     /// let mut replay = tracing_replay::Replay::new();
@@ -162,7 +161,12 @@ impl Replay {
             })?;
 
             if line_index == 0 {
-                let now_since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                let now_since_epoch =
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|time_err| ReplayFileError::SystemTimeTooEarly {
+                            duration: time_err.duration(),
+                        })?;
                 let recording_since_epoch = Duration::new(
                     trace_record.meta.timestamp_s,
                     trace_record.meta.timestamp_subsec_us,
@@ -204,8 +208,8 @@ impl Replay {
     /// # {
     /// #    use std::io::Write;
     /// #    let mut file = std::fs::File::create(recording_path).unwrap();
-    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74773,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
-    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1708644606,"timestamp_subsec_us":74908,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[["message","I am an info event!"]],"metadata":{"id":4435670072,"name":"event tracing-rec/examples/events.rs:8","target":"events","level":"Info","module_path":"events","file":"tracing-rec/examples/events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543400,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"RegisterCallsite":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"}}}"#);
+    /// #    writeln!(file, "{}", r#"{"meta":{"timestamp_s":1715177340,"timestamp_subsec_us":543496,"thread_id":"ThreadId(1)","thread_name":"main"},"trace":{"Event":{"fields":[{"name":"message","value":{"Debug":"I am an info event!"}}],"metadata":{"id":4403349456,"name":"event tracing-rec/examples/record-events.rs:8","target":"record_events","level":"Info","module_path":"record_events","file":"tracing-rec/examples/record-events.rs","line":8,"fields":["message"],"kind":"Event"},"parent":"Current"}}}"#);
     /// # }
     ///
     /// let mut replay = tracing_replay::Replay::new();
@@ -257,6 +261,9 @@ pub enum ReplayFileError {
         inner: serde_json::Error,
         line_index: usize,
         line: String,
+    },
+    SystemTimeTooEarly {
+        duration: Duration,
     },
 }
 
@@ -374,7 +381,7 @@ impl Replay {
             Duration::new(record.meta.timestamp_s, record.meta.timestamp_subsec_us);
         let replay_since_epoch = record_since_epoch
             .checked_add(self.replay_time_delta)
-            .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+            .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).expect("SystemTime::now() is before the UNIX epoch, is there something wrong with the clock?"));
 
         let container = match record.trace {
             Trace::RegisterCallsite(rec_metadata) => {
@@ -447,7 +454,7 @@ impl Replay {
                 .lock()
                 .expect("replay internal state has become corrupted.");
             debug_assert!(
-                (*guard).get(&rec_new_span.id).is_none(),
+                !(*guard).contains_key(&rec_new_span.id),
                 "new span recorded span::Id that has already been seen!"
             );
             (*guard).insert(rec_new_span.id, MappedSpanId::Pending);
@@ -504,7 +511,7 @@ impl DispatchableMetadata {
 #[derive(Debug)]
 struct DispatchableEvent {
     metadata: &'static Metadata<'static>,
-    fields: Vec<(String, String)>,
+    fields: Vec<Field>,
     parent: recording::Parent,
 }
 
@@ -512,7 +519,7 @@ struct DispatchableEvent {
 struct DispatchableNewSpan {
     id: recording::SpanId,
     metadata: &'static Metadata<'static>,
-    fields: Vec<(String, String)>,
+    fields: Vec<Field>,
     parent: recording::Parent,
 }
 
@@ -535,7 +542,7 @@ struct DispatchableFollowsFrom {
 pub(crate) struct DispatchableRecordValues {
     id: recording::SpanId,
     metadata: &'static Metadata<'static>,
-    fields: Vec<(String, String)>,
+    fields: Vec<Field>,
 }
 
 struct ThreadDispatcher {
@@ -562,7 +569,9 @@ impl ThreadDispatcher {
     }
 
     fn dispatch(&self, timestamp: Duration, trace: DispatchableTrace) {
-        let delay = timestamp.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let delay = timestamp.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).expect(
+            "SystemTime::now() is before the UNIX epoch, is there something wrong with the clock?",
+        ));
         if !delay.is_zero() {
             thread::sleep(delay);
         }
@@ -605,7 +614,8 @@ impl ThreadDispatcher {
                             .lock()
                             .expect("replay internal state has become corrupted.");
 
-                        // TODO(hds): This should check that the entry is exactly Some(MappedSpanId::Pending) and nothing else.
+                        // TODO(hds): This should check that the entry is exactly
+                        // `Some(MappedSpanId::Pending)` and nothing else.
                         let current_value = (*guard).get(&dis_new_span.id);
                         debug_assert!(
                             matches!((*guard).get(&dis_new_span.id), Some(MappedSpanId::Pending)),
@@ -684,13 +694,16 @@ struct ThreadDispatcherHandle {
 
 fn create_field_values<'a>(
     metadata: &'static Metadata,
-    rec_fields: &'a [(String, String)],
+    rec_fields: &'a [Field],
 ) -> Vec<(field::Field, Option<&'a dyn tracing::Value>)> {
     let fields = metadata.fields();
     rec_fields
         .iter()
-        .filter_map(|(field_name, value)| {
-            Some((fields.field(field_name)?, Some(value as &dyn field::Value)))
+        .filter_map(|rec_field| {
+            Some((
+                fields.field(&rec_field.name)?,
+                Some((&rec_field.value).into()),
+            ))
         })
         .collect()
 }

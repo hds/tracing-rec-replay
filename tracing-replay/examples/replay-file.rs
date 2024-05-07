@@ -18,10 +18,12 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     };
 
     let mut replay = tracing_replay::Replay::new();
-    let summary = replay
+    let summary_result = replay
         .replay_file(&path)
-        .map_err(|err| format!("failed to replay file: {path}, error: {err}."))?;
+        .map_err(|err| format!("failed to replay file: {path}, error: {err}."));
     replay.close()?;
+
+    let summary = summary_result?;
     println!(
         "Successully replayed, record count: {record_count}.",
         record_count = summary.record_count

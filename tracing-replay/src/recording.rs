@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use tracing::field;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TraceRecord {
@@ -84,9 +85,43 @@ pub(crate) enum Parent {
     /// The new span has an explicitly-specified parent.
     Explicit(u64),
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Field {
+    pub(crate) name: String,
+    pub(crate) value: FieldValue,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) enum FieldValue {
+    Debug(String),
+    F64(f64),
+    I64(i64),
+    U64(u64),
+    I128(i128),
+    U128(u128),
+    Bool(bool),
+    Str(String),
+}
+
+impl<'a> From<&'a FieldValue> for &'a dyn field::Value {
+    fn from(value: &'a FieldValue) -> Self {
+        match value {
+            FieldValue::Debug(val) => val as &dyn field::Value,
+            FieldValue::F64(val) => val as &dyn field::Value,
+            FieldValue::I64(val) => val as &dyn field::Value,
+            FieldValue::U64(val) => val as &dyn field::Value,
+            FieldValue::I128(val) => val as &dyn field::Value,
+            FieldValue::U128(val) => val as &dyn field::Value,
+            FieldValue::Bool(val) => val as &dyn field::Value,
+            FieldValue::Str(val) => val as &dyn field::Value,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct Event {
-    pub(crate) fields: Vec<(String, String)>,
+    pub(crate) fields: Vec<Field>,
     pub(crate) metadata: Metadata,
     pub(crate) parent: Parent,
 }
@@ -94,7 +129,7 @@ pub(crate) struct Event {
 #[derive(Debug, Deserialize)]
 pub(crate) struct NewSpan {
     pub(crate) id: SpanId,
-    pub(crate) fields: Vec<(String, String)>,
+    pub(crate) fields: Vec<Field>,
     pub(crate) metadata: Metadata,
     pub(crate) parent: Parent,
 }
@@ -105,7 +140,7 @@ pub(crate) struct SpanId(u64);
 #[derive(Debug, Deserialize)]
 pub(crate) struct RecordValues {
     pub(crate) id: SpanId,
-    pub(crate) fields: Vec<(String, String)>,
+    pub(crate) fields: Vec<Field>,
 }
 
 #[derive(Debug, Deserialize)]
