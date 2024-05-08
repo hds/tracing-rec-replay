@@ -121,7 +121,7 @@ struct Metadata {
 impl From<&'static tracing::Metadata<'static>> for Metadata {
     fn from(value: &'static tracing::Metadata<'static>) -> Self {
         Self {
-            id: value as *const _ as u64,
+            id: std::ptr::from_ref(value) as u64,
             name: value.name(),
             target: value.target(),
             level: value.level().into(),
@@ -179,56 +179,124 @@ impl From<&span::Attributes<'_>> for Parent {
 }
 
 #[derive(Debug, Serialize)]
+struct Fields {
+    inner: Vec<Field>,
+}
+
+impl Fields {
+    fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+}
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.inner.push(Field::new(
+            field.name(),
+            FieldValue::Debug(format!("{value:?}")),
+        ));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::F64(value)));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::I64(value)));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::U64(value)));
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::I128(value)));
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::U128(value)));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::Bool(value)));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.inner
+            .push(Field::new(field.name(), FieldValue::Str(value.into())));
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Field {
+    name: &'static str,
+    value: FieldValue,
+}
+
+impl Field {
+    fn new(name: &'static str, value: FieldValue) -> Self {
+        Self { name, value }
+    }
+}
+
+#[derive(Debug, Serialize)]
+enum FieldValue {
+    Debug(String),
+    F64(f64),
+    I64(i64),
+    U64(u64),
+    I128(i128),
+    U128(u128),
+    Bool(bool),
+    Str(String),
+    // TODO(hds): add variants for Value and Error
+}
+
+#[derive(Debug, Serialize)]
 struct Event {
-    fields: Vec<(&'static str, String)>,
+    fields: Vec<Field>,
     metadata: Metadata,
     parent: Parent,
 }
 
 impl From<&tracing::Event<'_>> for Event {
     fn from(value: &tracing::Event<'_>) -> Self {
-        let mut event = Self {
-            fields: Vec::new(),
+        let mut fields = Fields::new();
+        value.record(&mut fields);
+
+        Self {
+            fields: fields.inner,
             metadata: value.metadata().into(),
             parent: Parent::from(value),
-        };
-        value.record(&mut event);
-
-        event
-    }
-}
-
-impl Visit for Event {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.fields.push((field.name(), format!("{value:?}")));
+        }
     }
 }
 
 #[derive(Debug, Serialize)]
 struct NewSpan {
     id: SpanId,
-    fields: Vec<(&'static str, String)>,
+    fields: Vec<Field>,
     metadata: Metadata,
     parent: Parent,
 }
 
 impl From<(&span::Attributes<'_>, &span::Id)> for NewSpan {
     fn from((attrs, id): (&span::Attributes<'_>, &span::Id)) -> Self {
-        let mut new_span = Self {
+        let mut fields = Fields::new();
+        attrs.record(&mut fields);
+
+        Self {
             id: id.into(),
-            fields: Vec::new(),
+            fields: fields.inner,
             metadata: attrs.metadata().into(),
             parent: Parent::from(attrs),
-        };
-        attrs.record(&mut new_span);
-
-        new_span
-    }
-}
-
-impl Visit for NewSpan {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.fields.push((field.name(), format!("{value:?}")));
+        }
     }
 }
 
@@ -244,24 +312,18 @@ impl From<&span::Id> for SpanId {
 #[derive(Debug, Serialize)]
 struct RecordValues {
     id: SpanId,
-    fields: Vec<(&'static str, String)>,
+    fields: Vec<Field>,
 }
 
 impl From<(&span::Id, &span::Record<'_>)> for RecordValues {
     fn from((id, values): (&span::Id, &span::Record<'_>)) -> Self {
-        let mut record_values = Self {
+        let mut fields = Fields::new();
+        values.record(&mut fields);
+
+        Self {
             id: id.into(),
-            fields: Vec::new(),
-        };
-        values.record(&mut record_values);
-
-        record_values
-    }
-}
-
-impl Visit for RecordValues {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.fields.push((field.name(), format!("{value:?}")));
+            fields: fields.inner,
+        }
     }
 }
 
